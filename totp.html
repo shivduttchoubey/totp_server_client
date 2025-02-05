@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Secure TOTP Generator</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-decoder/0.3.3/qrcode.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jssha/3.3.1/sha.js"></script>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            max-width: 400px;
+            margin: 2rem auto;
+            padding: 0 1rem;
+        }
+        .frame {
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            padding: 1rem;
+            margin: 1rem 0;
+        }
+        .frame h2 {
+            margin-top: 0;
+            font-size: 1rem;
+            color: #666;
+        }
+        .button-group {
+            display: flex;
+            gap: 0.5rem;
+        }
+        button {
+            padding: 0.5rem 1rem;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            background: #f8f8f8;
+            cursor: pointer;
+        }
+        button:hover {
+            background: #eee;
+        }
+        #totpDisplay {
+            font-family: monospace;
+            font-size: 2rem;
+            text-align: center;
+            margin: 1rem 0;
+        }
+        #progressBar {
+            width: 100%;
+            height: 4px;
+            background: #eee;
+            border-radius: 2px;
+            overflow: hidden;
+        }
+        #progressBar div {
+            height: 100%;
+            background: #4CAF50;
+            transition: width 0.1s linear;
+        }
+        .status {
+            text-align: center;
+            margin: 0.5rem 0;
+        }
+        .status.waiting {
+            color: #666;
+        }
+        .status.success {
+            color: #4CAF50;
+        }
+        .status.error {
+            color: #f44336;
+        }
+        #videoContainer {
+            width: 100%;
+            margin: 1rem 0;
+        }
+        video {
+            width: 100%;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+<body>
+    <div class="frame">
+        <h2>Input Method</h2>
+        <div class="button-group">
+            <button onclick="startCamera()">Scan QR Code</button>
+            <button onclick="document.getElementById('fileInput').click()">Select QR Image</button>
+            <input type="file" id="fileInput" hidden accept="image/*" onchange="handleFileSelect(event)">
+        </div>
+        <div id="videoContainer" style="display: none;">
+            <video id="video" playsinline></video>
+        </div>
+    </div>
+
+    <div class="frame">
+        <h2>Current TOTP</h2>
+        <div id="totpDisplay">------</div>
+        <div id="progressBar">
+            <div style="width: 0%"></div>
+        </div>
+        <div id="timeRemaining" class="status">Time remaining: --s</div>
+    </div>
+
+    <div class="frame">
+        <h2>Security Status</h2>
+        <div id="status" class="status waiting">✓ Waiting for QR code</div>
+    </div>
+
+    <script>
+        class TOTPGenerator {
+            constructor() {
+                this.currentSecret = null;
+                this.updateInterval = null;
+                this.videoStream = null;
+            }
+
+            async startCamera() {
+                try {
+                    const videoElement = document.getElementById('video');
+                    const videoContainer = document.getElementById('videoContainer');
+                    
+                    this.videoStream = await navigator.mediaDevices.getUserMedia({ 
+                        video: { facingMode: 'environment' } 
+                    });
+                    
+                    videoElement.srcObject = this.videoStream;
+                    videoContainer.style.display = 'block';
+                    videoElement.play();
+
+                    // Start scanning
+                    this.scanQRCode();
+                } catch (error) {
+                    this.showError('Cannot access camera: ' + error.message);
+                }
+            }
+
+            stopCamera() {
+                if (this.videoStream) {
+                    this.videoStream.getTracks().forEach(track => track.stop());
+                    this.videoStream = null;
+                    document.getElementById('videoContainer').style.display = 'none';
+                }
+            }
+
+            async scanQRCode() {
+                const video = document.getElementById('video');
+                const qr = new QrCode();
+                
+                const scanFrame = async () => {
+                    try {
+                        const result = await qr.decodeFromVideo(video);
+                        if (result) {
+                            this.stopCamera();
+                            this.processQRData(result);
+                            return;
+                        }
+                    } catch (error) {
+                        // Ignore errors and continue scanning
+                    }
+                    
+                    if (this.videoStream) {
+                        requestAnimationFrame(scanFrame);
+                    }
+                };
+
+                scanFrame();
+            }
+
+            async handleFile(event) {
+                const file = event.target.files[0];
+                if (!file) return;
+
+                try {
+                    const qr = new QrCode();
+                    const result = await qr.decodeFromImage(file);
+                    if (result) {
+                        this.processQRData(result);
+                    } else {
+                        throw new Error('No QR code found in image');
+                    }
+                } catch (error) {
+                    this.showError('Error processing image: ' + error.message);
+                }
+            }
+
+            processQRData(data) {
+                try {
+                    if (!data.startsWith('otpauth://totp/')) {
+                        throw new Error('Invalid OTP URI format');
+                    }
+
+                    const secretMatch = data.match(/secret=([A-Z2-7]+=*)/);
+                    if (!secretMatch) {
+                        throw new Error('No valid secret found in QR code');
+                    }
+
+                    const secret = secretMatch[1];
+                    this.currentSecret = secret;
+                    
+                    document.getElementById('status').className = 'status success';
+                    document.getElementById('status').textContent = '✓ Secret secured in memory';
+                    
+                    this.startTOTPUpdates();
+                } catch (error) {
+                    this.showError('Error processing QR code: ' + error.message);
+                }
+            }
+
+            generateTOTP(secret) {
+                // RFC 6238 TOTP implementation
+                const epoch = Math.floor(Date.now() / 1000);
+                const time = Math.floor(epoch / 30);
+                const timeHex = time.toString(16).padStart(16, '0');
+
+                const shaObj = new jsSHA("SHA-1", "HEX");
+                const secretBytes = this.base32ToHex(secret);
+                shaObj.setHMACKey(secretBytes, "HEX");
+                shaObj.update(timeHex);
+                const hmac = shaObj.getHMAC("HEX");
+
+                const offset = parseInt(hmac.substring(hmac.length - 1), 16);
+                const otp = (parseInt(hmac.substr(offset * 2, 8), 16) & 0x7fffffff) % 1000000;
+                return otp.toString().padStart(6, '0');
+            }
+
+            base32ToHex(base32) {
+                const base32chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+                let bits = '';
+                let hex = '';
+
+                for (let i = 0; i < base32.length; i++) {
+                    const val = base32chars.indexOf(base32.charAt(i).toUpperCase());
+                    bits += val.toString(2).padStart(5, '0');
+                }
+
+                for (let i = 0; i + 4 <= bits.length; i += 4) {
+                    const chunk = bits.substr(i, 4);
+                    hex += parseInt(chunk, 2).toString(16);
+                }
+
+                return hex;
+            }
+
+            startTOTPUpdates() {
+                if (this.updateInterval) {
+                    clearInterval(this.updateInterval);
+                }
+
+                const updateTOTP = () => {
+                    if (!this.currentSecret) return;
+
+                    const totp = this.generateTOTP(this.currentSecret);
+                    const remaining = 30 - (Math.floor(Date.now() / 1000) % 30);
+                    const progress = (remaining / 30) * 100;
+
+                    document.getElementById('totpDisplay').textContent = totp;
+                    document.getElementById('timeRemaining').textContent = `Time remaining: ${remaining}s`;
+                    document.getElementById('progressBar').firstElementChild.style.width = `${progress}%`;
+                };
+
+                updateTOTP();
+                this.updateInterval = setInterval(updateTOTP, 100);
+            }
+
+            showError(message) {
+                document.getElementById('status').className = 'status error';
+                document.getElementById('status').textContent = '✗ ' + message;
+            }
+        }
+
+        // Initialize the application
+        const app = new TOTPGenerator();
+
+        // Event handlers
+        function startCamera() {
+            app.startCamera();
+        }
+
+        function handleFileSelect(event) {
+            app.handleFile(event);
+        }
+    </script>
+</body>
+</html>
